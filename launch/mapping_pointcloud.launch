@@ -1,6 +1,7 @@
 <launch>
 
-	<param name="pc_name" type="string" value="YOUR_POINTCLOUD.pcd" />
+	<arg name="pc_name" default="YOUR_POINTCLOUD.pcd" />
+	<param name="pc_name" type="string" value="$(arg pc_name)" />
 	<rosparam command="load" file="$(find ImMesh)/config/offline_pointcloud.yaml" />
 	<param name="meshing/distance_scale" type="double" value="1.0" /> 
 	<param name="gui_font_size" type="int" value="20" /> 

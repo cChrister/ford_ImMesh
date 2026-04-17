@@ -43,6 +43,11 @@ different license.
 #include "meshing/mesh_rec_geometry.hpp"
 #include "tools/tools_thread_pool.hpp"
 
+// 本文件负责：
+// 1) 在线/离线点云送入网格重建队列
+// 2) 后台线程池执行增量网格重建
+// 3) 将重建结果写回 Triangle_manager，并维护显示帧索引/日志
+
 extern Global_map       g_map_rgb_pts_mesh;
 extern Triangle_manager g_triangles_manager;
 extern int              g_current_frame;
@@ -66,6 +71,7 @@ static double g_LiDAR_frame_avg_time;
 
 struct Rec_mesh_data_package
 {
+    // 单帧重建任务包：点云 + 位姿 + 帧号
     pcl::PointCloud< pcl::PointXYZI >::Ptr m_frame_pts;
     Eigen::Quaterniond                     m_pose_q;
     Eigen::Vector3d                        m_pose_t;
@@ -91,11 +97,13 @@ LiDAR_frame_pts_and_pose_vec                                                    
 
 void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr frame_pts, Eigen::Quaterniond pose_q, Eigen::Vector3d pose_t, int frame_idx )
 {
+    // 单帧增量网格重建核心流程（在线线程池任务）
     while ( g_flag_pause )
     {
         std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
     }
 
+    // 缓存当前帧点与位姿，供显示线程绘制轨迹与当前帧点云
     Eigen::Matrix< double, 7, 1 > pose_vec;
     pose_vec.head< 4 >() = pose_q.coeffs().transpose();
     pose_vec.block( 4, 0, 3, 1 ) = pose_t;
@@ -108,9 +116,11 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
     // g_eigen_vec_vec.push_back( std::make_pair( empty_vec, pose_vec ) );
     // TODO : add time tic toc
 
+    // 控制每帧写入全局地图的采样步长，平衡实时性与精度
     int                 append_point_step = std::max( ( int ) 1, ( int ) std::round( frame_pts->points.size() / appending_pts_frame ) );
     Common_tools::Timer tim, tim_total;
     g_mutex_append_map.lock();
+    // 将点并入全局 RGB 体素地图，并记录本次访问体素
     g_map_rgb_pts_mesh.append_points_to_global_map( *frame_pts, frame_idx, nullptr, append_point_step );
     std::unordered_set< std::shared_ptr< RGB_Voxel > > voxels_recent_visited = g_map_rgb_pts_mesh.m_voxels_recent_visited;
     g_mutex_append_map.unlock();
@@ -126,6 +136,7 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
     tim_total.tic();
     try
     {
+        // 体素级并行重建：每个体素局部独立做三角化并产生“增删三角面”
         tbb::parallel_for_each( voxels_recent_visited.begin(), voxels_recent_visited.end(), [ & ]( const std::shared_ptr< RGB_Voxel > &voxel ) {
             // std::unique_lock<std::mutex> thr_lock(mtx_single_thr);
             // printf_line;
@@ -150,7 +161,7 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
                 return;
             }
             g_mutex_append_map.unlock();
-            // Voxel-wise mesh pull
+            // pull：拉取该体素邻域点并做邻域扩展/离群点剔除
             pts_in_voxels = retrieve_neighbor_pts_kdtree( pts_in_voxels );
             pts_in_voxels = remove_outlier_pts( pts_in_voxels, voxel );
 
@@ -191,10 +202,10 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
             }
             Triangle_set triangles_sets = g_triangles_manager.find_relative_triangulation_combination( relative_point_indices );
             Triangle_set triangles_to_remove, triangles_to_add, existing_triangle;
-            // Voxel-wise mesh commit
+            // commit：与现有三角面做差分，得到“待删除/待新增”集合
             triangle_compare( triangles_sets, add_triangle_idx, triangles_to_remove, triangles_to_add, &existing_triangle );
             
-            // Refine normal index
+            // 统一三角面朝向（法向方向）以减少渲染与几何不一致
             for ( auto triangle_ptr : triangles_to_add )
             {
                 correct_triangle_index( triangle_ptr, g_eigen_vec_vec[ frame_idx ].second.block( 4, 0, 3, 1 ), voxel->m_short_axis );
@@ -224,7 +235,7 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
     double              mul_thr_cost_time = tim.toc( " ", 0 );
     Common_tools::Timer tim_triangle_cost;
     int                 total_delete_triangle = 0, total_add_triangle = 0;
-    // Voxel-wise mesh push
+    // push：将所有体素的增删结果统一写回 Triangle_manager
     for ( auto &triangles_set : removed_triangle_list )
     {
         total_delete_triangle += triangles_set.second.size();
@@ -245,6 +256,7 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
     
     g_mutex_reconstruct_mesh.unlock();
    
+    // 记录重建耗时统计
     if ( g_fp_cost_time )
     {
         if ( frame_idx > 0 )
@@ -253,6 +265,7 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
                  g_LiDAR_frame_avg_time );
         fflush( g_fp_cost_time );
     }
+    // 更新显示线程使用的当前帧索引
     if ( g_current_frame < frame_idx )
     {
         g_current_frame = frame_idx;
@@ -271,6 +284,8 @@ void incremental_mesh_reconstruction( pcl::PointCloud< pcl::PointXYZI >::Ptr fra
 
 void service_reconstruct_mesh()
 {
+    // 网格重建后台服务线程：
+    // 持续从任务队列取帧，并提交到线程池做增量重建
     if ( g_thread_pool_rec_mesh == nullptr )
     {
         g_thread_pool_rec_mesh = std::make_shared< Common_tools::ThreadPool >( g_maximum_thread_for_rec_mesh );
@@ -285,6 +300,7 @@ void service_reconstruct_mesh()
             }
 
             g_mutex_data_package_lock.lock();
+            // 队列过长时丢弃旧帧，避免内存失控与延迟无限增长
             while ( g_rec_mesh_data_package_list.size() > 1e5 )
             {
                 cout << "Drop mesh frame [" << g_rec_mesh_data_package_list.front().m_frame_idx;
@@ -298,7 +314,7 @@ void service_reconstruct_mesh()
             Rec_mesh_data_package data_pack_front = g_rec_mesh_data_package_list.front();
             g_rec_mesh_data_package_list.pop_front();
             g_mutex_data_package_lock.unlock();
-            // ANCHOR - Comment follow line to disable meshing
+            // 若关闭重建开关，仅消费队列不执行重建任务
             if ( g_enable_mesh_rec )
             {
                 g_thread_pool_rec_mesh->commit_task( incremental_mesh_reconstruction, data_pack_front.m_frame_pts, data_pack_front.m_pose_q,
@@ -314,6 +330,7 @@ std::thread *g_rec_mesh_thr = nullptr;
 
 void start_mesh_threads( int maximum_threads = 20 )
 {
+    // 仅初始化一次重建服务线程
     if ( g_eigen_vec_vec.size() <= 0 )
     {
         g_eigen_vec_vec.resize( 1e6 );
@@ -327,6 +344,7 @@ void start_mesh_threads( int maximum_threads = 20 )
 
 void reconstruct_mesh_from_pointcloud( pcl::PointCloud< pcl::PointXYZI >::Ptr frame_pts, double minimum_pts_distance )
 {
+    // 离线入口：将整帧点云降采样后直接投递到重建队列
     start_mesh_threads();
     cout << "=== reconstruct_mesh_from_pointcloud ===" << endl;
     cout << "Input pointcloud have " << frame_pts->points.size() << " points." << endl;
@@ -346,6 +364,7 @@ void reconstruct_mesh_from_pointcloud( pcl::PointCloud< pcl::PointXYZI >::Ptr fr
 
 void open_log_file()
 {
+    // 打开重建与位姿日志文件（首次调用创建）
     if ( g_fp_cost_time == nullptr || g_fp_lio_state == nullptr )
     {
         Common_tools::create_dir( std::string( Common_tools::get_home_folder() ).append( "/ImMesh_output" ).c_str() );
@@ -362,6 +381,7 @@ void open_log_file()
 
 std::vector< vec_4 > convert_pcl_pointcloud_to_vec( pcl::PointCloud< pcl::PointXYZI > &pointcloud )
 {
+    // 工具函数：PCL 点云 -> Eigen 向量数组（xyz + intensity）
     int                  pt_size = pointcloud.points.size();
     std::vector< vec_4 > eigen_pt_vec( pt_size );
     for ( int i = 0; i < pt_size; i++ )
@@ -376,9 +396,11 @@ std::vector< vec_4 > convert_pcl_pointcloud_to_vec( pcl::PointCloud< pcl::PointX
 
 void Voxel_mapping::map_incremental_grow()
 {
+    // 启动（或复用）网格重建后台线程池
     start_mesh_threads( m_meshing_maximum_thread_for_rec_mesh );
     if ( m_use_new_map )
     {
+        // 暂停模式下阻塞，避免在暂停期间继续写地图
         while ( g_flag_pause )
         {
             std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
@@ -387,9 +409,11 @@ void Voxel_mapping::map_incremental_grow()
         pcl::PointCloud< pcl::PointXYZI >::Ptr world_lidar( new pcl::PointCloud< pcl::PointXYZI > );
         pcl::PointCloud< pcl::PointXYZI >::Ptr world_lidar_full( new pcl::PointCloud< pcl::PointXYZI > );
 
+        // 每个点附带协方差信息，用于体素地图增量更新
         std::vector< Point_with_var > pv_list;
         // TODO: saving pointcloud to file
         // pcl::io::savePCDFileBinary(Common_tools::get_home_folder().append("/r3live_output/").append("last_frame.pcd").c_str(), *m_feats_down_body);
+        // 将降采样后的机体系点云变换到世界坐标系
         transformLidar( state.rot_end, state.pos_end, m_feats_down_body, world_lidar );
         for ( size_t i = 0; i < world_lidar->size(); i++ )
         {
@@ -397,6 +421,7 @@ void Voxel_mapping::map_incremental_grow()
             pv.m_point << world_lidar->points[ i ].x, world_lidar->points[ i ].y, world_lidar->points[ i ].z;
             M3D point_crossmat = m_cross_mat_list[ i ];
             M3D var = m_body_cov_list[ i ];
+            // 将机体系误差传播到世界系，构造点的总不确定度
             var = ( state.rot_end * m_extR ) * var * ( state.rot_end * m_extR ).transpose() +
                   ( -point_crossmat ) * state.cov.block< 3, 3 >( 0, 0 ) * ( -point_crossmat ).transpose() + state.cov.block< 3, 3 >( 3, 3 );
             pv.m_var = var;
@@ -404,27 +429,33 @@ void Voxel_mapping::map_incremental_grow()
         }
 
         // pcl::PointCloud< pcl::PointXYZI >::Ptr world_lidar( new pcl::PointCloud< pcl::PointXYZI > );
+        // 按不确定度排序后更新体素地图（高置信点优先）
         std::sort( pv_list.begin(), pv_list.end(), var_contrast );
         updateVoxelMap( pv_list, m_max_voxel_size, m_max_layer, m_layer_init_size, m_max_points_size, m_min_eigen_value, m_feat_map );
         double vx_map_cost_time = omp_get_wtime();
         g_vx_map_frame_cost_time = ( vx_map_cost_time - g_LiDAR_frame_start_time ) * 1000.0;
         // cout << "vx_map_cost_time = " <<  g_vx_map_frame_cost_time << " ms" << endl;
 
+        // 使用未降采样点云作为网格重建输入，尽量保留几何细节
         transformLidar( state.rot_end, state.pos_end, m_feats_undistort, world_lidar_full );
          
+        // 将当前帧打包入队，由后台线程异步执行增量网格重建
         g_mutex_data_package_lock.lock();
         g_rec_mesh_data_package_list.emplace_back( world_lidar_full, Eigen::Quaterniond( state.rot_end ), state.pos_end, g_frame_idx );
         g_mutex_data_package_lock.unlock();
         open_log_file();
+        // 记录当前 LIO 状态，便于离线分析
         if ( g_fp_lio_state != nullptr )
         {
             dump_lio_state_to_log( g_fp_lio_state );
         }
+        // 推进重建帧号（显示线程以此追踪当前帧）
         g_frame_idx++;
     }
 
     if ( !m_use_new_map )
     {
+        // 兼容旧地图模式：仅维护 ikd-tree 点地图，不走新体素+网格链路
         for ( int i = 0; i < m_feats_down_size; i++ )
         {
             /* transform to world frame */

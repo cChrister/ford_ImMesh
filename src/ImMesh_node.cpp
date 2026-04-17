@@ -119,7 +119,7 @@ int                          if_first_call = 1;
 std::string          g_debug_string;
 int                  g_current_frame = -1;
 
-// GUI settting
+// GUI 全局开关与渲染参数
 bool   g_display_mesh = true;
 int    g_enable_mesh_rec = true;
 int    g_save_to_offline_bin = false;
@@ -150,6 +150,7 @@ Voxel_mapping voxel_mapping;
 
 void print_help_window( bool *if_display_help_win )
 {
+    // 快捷键帮助面板
     ImGui::Begin( "--- Help ---", if_display_help_win );
     ImGui::Text( "[H]     | Display/Close main windows" );
     ImGui::Text( "[C]     | Show/Close camera pose windows" );
@@ -168,6 +169,7 @@ void print_help_window( bool *if_display_help_win )
 
 void get_last_avr_pose( int current_frame_idx, Eigen::Quaterniond &q_avr, vec_3 &t_vec )
 {
+    // 计算最近窗口内的平均位姿，用于相机跟随与视角稳定
     const int win_ssd = 1;
     mat_3_3   lidar_frame_to_camera_frame;
     // Clang-format off
@@ -207,7 +209,7 @@ void get_last_avr_pose( int current_frame_idx, Eigen::Quaterniond &q_avr, vec_3 
 
 int main( int argc, char **argv )
 {
-    // Setup window
+    // -------------------- 程序初始化：ROS + OpenGL/ImGui --------------------
     pcl::console::setVerbosityLevel( pcl::console::L_ALWAYS );
     Common_tools::printf_software_version();
     printf_program( "ImMesh: An Immediate LiDAR Localization and Meshing Framework" );
@@ -230,6 +232,7 @@ int main( int argc, char **argv )
     }
 
     
+    // -------------------- 离线点云模式：若配置了 pcd 文件则先加载 --------------------
     g_enable_mesh_rec = voxel_mapping.m_if_enable_mesh_rec;
     cout << "Offline point cloud name: " << ANSI_COLOR_GREEN_BOLD << voxel_mapping.m_pointcloud_file_name << ANSI_COLOR_RESET << endl;
     if ( Common_tools::if_file_exist( voxel_mapping.m_pointcloud_file_name ) )
@@ -249,6 +252,7 @@ int main( int argc, char **argv )
     }
     
     
+    // -------------------- 从参数服务器读取网格重建相关配置 --------------------
     cout << "====Loading parameter=====" << endl;
 
     threshold_scale = voxel_mapping.m_meshing_distance_scale;
@@ -272,7 +276,9 @@ int main( int argc, char **argv )
     g_map_rgb_pts_mesh.m_recent_visited_voxel_activated_time = 0;
     cout << "==== Loading parameter end =====" << endl;
 
+    // 后台线程1：激光/IMU 融合与建图
     std::thread thr_mapping = std::thread( &Voxel_mapping::service_LiDAR_update, &voxel_mapping );
+    // 后台线程2：三角面片重建与同步
     std::thread thr = std::thread( service_refresh_and_synchronize_triangle, 100 );
     std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
     Common_tools::Timer disp_tim;
@@ -284,7 +290,7 @@ int main( int argc, char **argv )
     g_gl_camera.m_gl_cam.m_camera_z_far = 1500;
     g_gl_camera.m_gl_cam.m_camera_z_near = 0.1;
     
-    // Rasterization configuration
+    // 深度增强显示（将重建网格做一次深度栅格化，强化当前帧点云可视化）
     Cam_view m_depth_view_camera;
     m_depth_view_camera.m_display_w = 640;
     m_depth_view_camera.m_display_h = 480;
@@ -297,6 +303,7 @@ int main( int argc, char **argv )
 
     while ( !glfwWindowShouldClose( window ) )
     {
+        // -------------------- 每帧渲染循环 --------------------
         g_gl_camera.draw_frame_start();
 
         Eigen::Quaterniond q_last_avr;
@@ -328,6 +335,7 @@ int main( int argc, char **argv )
             }
         }
 
+        // 主控制面板（ImGui）
         if ( g_display_main_window )
         {
             ImGui::Begin( "ImMesh's Main_windows", &g_display_main_window );               // Create a window called "Hello, world!" and append into it.
@@ -419,6 +427,7 @@ int main( int argc, char **argv )
             ImGui::End();
         }
 
+        // 可选：绘制当前 LiDAR 点与深度增强点
         if(g_draw_LiDAR_point)
         {
             if ( m_depth_view_camera.m_if_draw_depth_pts )
@@ -431,6 +440,7 @@ int main( int argc, char **argv )
             }
         }
 
+        // 可选：相机跟随当前轨迹
         if ( g_follow_cam )
         {
             if ( g_current_frame > 1 )
@@ -450,6 +460,7 @@ int main( int argc, char **argv )
             g_gl_camera.draw_camera_window( g_display_camera_pose_window );
         }
 
+        // 绘制坐标轴与地平面参考
         if ( g_if_draw_z_plane )
         {
             g_axis_shader.draw( g_gl_camera.m_gl_cam.m_glm_projection_mat,
@@ -458,18 +469,20 @@ int main( int argc, char **argv )
                                         Common_tools::eigen2glm( g_gl_camera.m_gl_cam.m_camera_pose_mat44_inverse ) );
         }
 
+        // 绘制在线重建网格
         if ( g_display_mesh )
         {
             draw_triangle( g_gl_camera.m_gl_cam );
         }
 
+        // 绘制相机位姿与轨迹
         if ( g_current_frame >= 0 )
         {
             draw_camera_pose( g_current_frame, g_draw_path_size, g_display_camera_size );
             draw_camera_trajectory( g_current_frame + 1, g_draw_path_size);
         }
         
-        // For Key-board control
+        // 键盘交互（窗口/网格/跟随/保存视角等开关）
         if ( g_gl_camera.if_press_key( "H" ) )
         {
             g_display_main_window = !g_display_main_window;
@@ -524,7 +537,7 @@ int main( int argc, char **argv )
         g_gl_camera.draw_frame_finish();
     }
 
-    // Cleanup
+    // -------------------- 资源释放 --------------------
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

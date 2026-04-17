@@ -1659,10 +1659,17 @@ void Voxel_mapping::init_ros_node()
 
 int Voxel_mapping::service_LiDAR_update()
 {
+    // 主工作线程：
+    // 1) 订阅 LiDAR/IMU 并完成同步打包
+    // 2) IMU 传播 + LiDAR 迭代更新
+    // 3) 增量建图/网格重建
+    // 4) 发布里程计、点云与调试信息
     cout << "debug:" << m_debug << " MIN_IMG_COUNT: " << MIN_IMG_COUNT << endl;
     m_pcl_wait_pub->clear();
     // if (m_lidar_en)
     // {
+    // 根据雷达类型选择订阅入口：
+    // Livox(CustomMsg) 走 livox_pcl_cbk，其他 PointCloud2 走 standard_pcl_cbk
     ros::Subscriber sub_pcl;
     if ( m_p_pre->lidar_type == AVIA || m_p_pre->lidar_type == MID360 )
     {
@@ -1673,8 +1680,10 @@ int Voxel_mapping::service_LiDAR_update()
         sub_pcl = m_ros_node_ptr->subscribe( m_lid_topic, 200000, &Voxel_mapping::standard_pcl_cbk, this );
     }
     // }
+    // IMU 订阅用于状态传播与去畸变
     ros::Subscriber sub_imu = m_ros_node_ptr->subscribe( m_imu_topic, 200000, &Voxel_mapping::imu_cbk, this );
     // ros::Subscriber sub_img = m_ros_node_ptr->subscribe(m_img_topic, 200000, img_cbk);
+    // 结果发布通道（里程计、点云、路径、可视化）
     ros::Publisher pubLaserCloudFullRes = m_ros_node_ptr->advertise< sensor_msgs::PointCloud2 >( "/cloud_registered", 100 );
     ros::Publisher pubLaserCloudVoxel = m_ros_node_ptr->advertise< sensor_msgs::PointCloud2 >( "/cloud_voxel", 100 );
     ros::Publisher pubVisualCloud = m_ros_node_ptr->advertise< sensor_msgs::PointCloud2 >( "/cloud_visual_map", 100 );
@@ -1774,11 +1783,13 @@ int Voxel_mapping::service_LiDAR_update()
     // signal( SIGINT, SigHandle );
     ros::Rate rate( 5000 );
     bool      status = ros::ok();
+    // 高频主循环：不断取同步后的测量包进行一次完整更新
     while ( ( status = ros::ok() ) )
     {
         if ( m_flg_exit )
             break;
         ros::spinOnce();
+        // 将 LiDAR 与 IMU 对齐打包；若数据不足则等待下一轮
         if ( !sync_packages( m_Lidar_Measures ) )
         {
             status = ros::ok();
@@ -1788,6 +1799,7 @@ int Voxel_mapping::service_LiDAR_update()
         }
 
         /*** Packaged got ***/
+        // rosbag 回放时间回退时，重置 IMU 处理状态
         if ( m_flg_reset )
         {
             ROS_WARN( "reset when rosbag play back" );
@@ -1796,6 +1808,7 @@ int Voxel_mapping::service_LiDAR_update()
             continue;
         }
 
+        // 首帧记录基准时间，用于后续相对时间与初始化逻辑
         if ( !m_is_first_frame )
         {
             m_first_lidar_time = m_Lidar_Measures.lidar_beg_time;
@@ -1812,6 +1825,7 @@ int Voxel_mapping::service_LiDAR_update()
         t0 = omp_get_wtime();
         g_LiDAR_frame_start_time = t0;
         auto t_all_begin = std::chrono::high_resolution_clock::now();
+        // IMU 传播 + 点云去畸变（得到当前帧体坐标点）
 #ifdef USE_IKFOM
         p_imu->Process( LidarMeasures, kf, feats_undistort );
         state_point = kf.get_x();
@@ -1858,6 +1872,7 @@ int Voxel_mapping::service_LiDAR_update()
             }
         }
 
+        // 记录预积分/状态日志（调试与离线分析）
         if ( m_lidar_en )
         {
             m_euler_cur = RotMtoEuler( state.rot_end );
@@ -1873,6 +1888,7 @@ int Voxel_mapping::service_LiDAR_update()
 #endif
         }
 
+        // 当前帧无有效点时直接跳过，避免后续匹配无意义计算
         if ( m_feats_undistort->empty() || ( m_feats_undistort == nullptr ) )
         {
             cout << " No point!!!" << endl;
@@ -1884,13 +1900,13 @@ int Voxel_mapping::service_LiDAR_update()
         if ( !m_use_new_map )
             laser_map_fov_segment();
 
-        /*** downsample the feature points in a scan ***/
+        /*** 当前帧点云降采样，降低匹配与建图开销 ***/
         m_downSizeFilterSurf.setInputCloud( m_feats_undistort );
         m_downSizeFilterSurf.filter( *m_feats_down_body );
         // std::cout << "feats size" << m_feats_undistort->size() << ", down size: " << m_feats_down_body->size() << std::endl;
         m_feats_down_size = m_feats_down_body->points.size();
 
-        /*** initialize the map ***/
+        /*** 地图初始化：新地图模式下先用前几帧完成体素地图种子构建 ***/
         if ( m_use_new_map )
         {
             if ( !m_init_map )
@@ -1920,7 +1936,7 @@ int Voxel_mapping::service_LiDAR_update()
         // cout<<"LidarMeasures.lidar_beg_time: "<<LidarMeasures.lidar_beg_time -
         // 1634087477.0<<endl;
 
-        /*** ICP and iterated Kalman filter update ***/
+        /*** ICP + 迭代滤波更新：估计当前位姿并更新状态协方差 ***/
         m_normvec->resize( m_feats_down_size );
         m_feats_down_world->clear();
         m_feats_down_world->resize( m_feats_down_size );
@@ -1959,27 +1975,34 @@ int Voxel_mapping::service_LiDAR_update()
             lio_state_estimation( state_propagat );
         }
 #endif
-        double t_update_end = omp_get_wtime();
-        /******* Publish odometry *******/
-        m_euler_cur = RotMtoEuler( state.rot_end );
-        m_geo_Quat = tf::createQuaternionMsgFromRollPitchYaw( m_euler_cur( 0 ), m_euler_cur( 1 ), m_euler_cur( 2 ) );
-        publish_odometry( pubOdomAftMapped );
-        kitti_log( fp_kitti );
-        /*** add the feature points to map kdtree ***/
-        t3 = omp_get_wtime();
-        // cout << "Frame time consumption:" << (t3 - t0)*1000.0 << " ms" << endl;
+        double t_update_end = omp_get_wtime(); // 获取状态估计更新后的时间
 
+        /******* 发布里程计 *******/
+        m_euler_cur = RotMtoEuler( state.rot_end ); // 将旋转矩阵转为欧拉角（当前帧姿态）
+        m_geo_Quat = tf::createQuaternionMsgFromRollPitchYaw( m_euler_cur( 0 ), m_euler_cur( 1 ), m_euler_cur( 2 ) ); // 利用欧拉角生成四元数消息
+        publish_odometry( pubOdomAftMapped ); // 发布里程计信息
+        kitti_log( fp_kitti );                // 保存kitti格式的轨迹日志
+
+        /*** 增量建图/网格重建入口 ***/
+        t3 = omp_get_wtime(); // 记录建图处理开始时间
+        // cout << "Frame time consumption:" << (t3 - t0)*1000.0 << " ms" << endl; // 打印本帧耗时(可选)
+
+        // 进行增量式地图成长（如激光里程计可用）
         if ( m_lidar_en )
             map_incremental_grow();
 
+        // 发布平面点云地图（如需要）
         if ( m_is_pub_plane_map )
             pubPlaneMap( m_feat_map, voxel_pub, state.pos_end );
+
+        // 统计本帧整体耗时
         auto t_all_end = std::chrono::high_resolution_clock::now();
         auto all_time = std::chrono::duration_cast< std::chrono::duration< double > >( t_all_end - t_all_begin ).count() * 1000;
-        // std::cout << "[Time]: all time:" << all_time << " ms" << std::endl;
-        t5 = omp_get_wtime();
-        m_kdtree_incremental_time = t5 - t3 + m_readd_time;
-        /******* Publish points *******/
+        // std::cout << "[Time]: all time:" << all_time << " ms" << std::endl; // 打印总耗时(可选)
+
+        t5 = omp_get_wtime(); // 记录建图处理结束时间
+        m_kdtree_incremental_time = t5 - t3 + m_readd_time; // 计算 kdtree 增量更新所花费的时间（包括重建时间）
+        /******* 发布点云与路径 *******/
         PointCloudXYZI::Ptr laserCloudFullRes( m_dense_map_en ? m_feats_undistort : m_feats_down_body );
         int                 size = laserCloudFullRes->points.size();
         PointCloudXYZI::Ptr laserCloudWorld( new PointCloudXYZI( size, 1 ) );
@@ -2001,7 +2024,7 @@ int Voxel_mapping::service_LiDAR_update()
         publish_mavros( mavros_pose_publisher );
         // #endif
 
-        /*** Debug variables ***/
+        /*** 调试计时与统计量更新 ***/
         frame_num++;
         aver_time_consu = aver_time_consu * ( frame_num - 1 ) / frame_num + ( t5 - t0 ) / frame_num;
         aver_time_icp = aver_time_icp * ( frame_num - 1 ) / frame_num + ( t_update_end - t_update_start ) / frame_num;

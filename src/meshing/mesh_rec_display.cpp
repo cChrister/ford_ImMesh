@@ -28,7 +28,7 @@ Common_tools::Camera_pose_shader    g_camera_pose_shader;
 
 // std::map< Visibility_region_ptr, Common_tools::Triangle_facet_shader  > g_map_region_triangle_shader;
 
-// ANCHOR - draw_triangle
+// 网格显示相关全局状态（渲染线程与同步线程共享）
 #include <chrono>
 #include <thread>
 std::mutex mutex_triangle_vec;
@@ -49,6 +49,7 @@ vec_3f        g_axis_min_max[ 2 ];
 
 struct Region_triangles_shader
 {
+    // 单个网格区域在 OpenGL 侧的缓存与渲染器封装
     std::vector< vec_3f >               m_triangle_pt_vec;
     Common_tools::Triangle_facet_shader m_triangle_facet_shader;
     int                                 m_need_init_shader = true;
@@ -64,6 +65,7 @@ struct Region_triangles_shader
 
     void init_pointcloud()
     {
+        // 将 CPU 侧三角面顶点更新到 GPU 缓存
         std::unique_lock< std::mutex > lock( *m_mutex_ptr );
         if ( m_if_set_color )
         {
@@ -77,7 +79,7 @@ struct Region_triangles_shader
 
     void unparse_triangle_set_to_vector( const Triangle_set &tri_angle_set )
     {
-        // TODO: synchronized data buffer here:
+        // 将三角面集合展开为连续顶点数组，并按需做平滑
         std::unique_lock< std::mutex > lock( *m_mutex_ptr );
         m_triangle_pt_vec.resize( tri_angle_set.size() * 3 );
         // cout << "Number of pt_size = " << m_triangle_pt_list.size() << endl;
@@ -104,6 +106,7 @@ struct Region_triangles_shader
 
     void get_axis_min_max( vec_3f *axis_min_max = nullptr )
     {
+        // 统计当前区域三角面顶点的包围盒范围（用于颜色映射）
         if ( axis_min_max != nullptr )
         {
             for ( int i = 0; i < m_triangle_pt_vec.size(); i++ )
@@ -138,6 +141,7 @@ struct Region_triangles_shader
 
     void synchronized_from_region( Sync_triangle_set *sync_triangle_set, vec_3f *axis_min_max = nullptr )
     {
+        // 从重建线程的同步容器拉取最新三角面数据
         if ( sync_triangle_set == nullptr )
         {
             cout << "sync_triangle_set == nullptr" << endl;
@@ -157,6 +161,7 @@ struct Region_triangles_shader
 
     void draw( const Cam_view &gl_cam )
     {
+        // 延迟初始化 shader，并在数据更新时刷新 GPU 缓冲
         if ( m_need_init_shader )
         {
             init_openGL_shader();
@@ -177,6 +182,7 @@ struct Region_triangles_shader
 
 void display_current_LiDAR_pts( int current_frame_idx, double pts_size, vec_4f color )
 {
+    // 绘制当前帧原始 LiDAR 点
     if ( current_frame_idx < 1 )
     {
         return;
@@ -189,6 +195,7 @@ void display_current_LiDAR_pts( int current_frame_idx, double pts_size, vec_4f c
 
 void display_reinforced_LiDAR_pts( std::vector< vec_3f > &pt_vec, double pts_size, vec_3f color )
 {
+    // 绘制深度增强后的点云
     g_LiDAR_point_shader.set_point_attr( pts_size );
     g_LiDAR_point_shader.set_pointcloud( pt_vec, color.cast< double >() );
     g_LiDAR_point_shader.draw( g_gl_camera.m_gl_cam.m_glm_projection_mat,
@@ -197,6 +204,7 @@ void display_reinforced_LiDAR_pts( std::vector< vec_3f > &pt_vec, double pts_siz
 
 void init_openGL_shader()
 {
+    // 初始化点云、网格、坐标轴、地面、相机等所有 shader
     g_LiDAR_point_shader.init( SHADER_DIR );
     g_path_shader.init( SHADER_DIR );
     // Init axis buffer
@@ -216,7 +224,7 @@ extern float                                                                g_wi
 extern bool          g_display_face;
 std::vector< vec_3 > pt_camera_traj;
 
-// ANCHOR - synchronize_triangle_list_for_disp
+// 将 Triangle_manager 中的区域三角面同步到显示缓存
 void synchronize_triangle_list_for_disp()
 {
     int region_size = g_triangles_manager.m_triangle_set_vector.size();
@@ -261,6 +269,7 @@ void synchronize_triangle_list_for_disp()
 
 void service_refresh_and_synchronize_triangle( double sleep_time )
 {
+    // 后台线程：周期性拉取重建结果并更新显示缓存
     g_axis_min_max[ 0 ] = vec_3f( 1e8, 1e8, 1e8 );
     g_axis_min_max[ 1 ] = vec_3f( -1e8, -1e8, -1e8 );
     while ( 1 )
@@ -272,6 +281,7 @@ void service_refresh_and_synchronize_triangle( double sleep_time )
 
 void draw_triangle( const Cam_view &gl_cam )
 {
+    // 主线程渲染所有区域三角面
     int region_size = g_region_triangles_shader_vec.size();
     for ( int region_idx = 0; region_idx < region_size; region_idx++ )
     {
@@ -283,6 +293,7 @@ void draw_triangle( const Cam_view &gl_cam )
 
 void display_camera_traj( float display_size )
 {
+    // 绘制相机轨迹折线
     if ( pt_camera_traj.size() == 0 )
     {
         return;
@@ -296,6 +307,7 @@ void display_camera_traj( float display_size )
 
 void draw_camera_pose( int current_frame_idx, float pt_disp_size, float display_cam_size )
 {
+    // 绘制当前帧相机位姿（将 LiDAR 坐标系转换为相机显示坐标系）
 
     Eigen::Quaterniond pose_q( g_eigen_vec_vec[ current_frame_idx ].second.head< 4 >() );
     vec_3              pose_t = g_eigen_vec_vec[ current_frame_idx ].second.block( 4, 0, 3, 1 );
@@ -314,6 +326,7 @@ void draw_camera_pose( int current_frame_idx, float pt_disp_size, float display_
 
 void draw_camera_trajectory( int current_frame_idx, float pt_disp_size )
 {
+    // 从轨迹缓存构建并绘制到当前帧的路径
     pt_camera_traj.clear();
     for ( int i = 0; i < current_frame_idx; i++ )
     {
