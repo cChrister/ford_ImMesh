@@ -81,7 +81,7 @@ void Preprocess::set( bool feat_en, int lid_type, double bld, int pfilt_num )
 
 void Preprocess::process( const livox_ros_driver::CustomMsg::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out )
 {
-    avia_handler( msg );
+    livox_handler( msg );
     *pcl_out = pl_surf;
 }
 
@@ -136,7 +136,7 @@ void Preprocess::process( const sensor_msgs::PointCloud2::ConstPtr &msg, PointCl
     *pcl_out = pl_surf;
 }
 
-void Preprocess::avia_handler( const livox_ros_driver::CustomMsg::ConstPtr &msg )
+void Preprocess::livox_handler( const livox_ros_driver::CustomMsg::ConstPtr &msg )
 {
     pl_surf.clear();
     pl_corn.clear();
@@ -160,7 +160,8 @@ void Preprocess::avia_handler( const livox_ros_driver::CustomMsg::ConstPtr &msg 
     {
         for ( uint i = 1; i < plsize; i++ )
         {
-            if ( ( msg->points[ i ].line < N_SCANS ) && ( ( msg->points[ i ].tag & 0x30 ) == 0x10 ) )
+            const bool pass_line = ( lidar_type == MID360 ) ? true : ( msg->points[ i ].line < N_SCANS );
+            if ( pass_line && ( ( msg->points[ i ].tag & 0x30 ) == 0x10 ) )
             {
                 pl_full[ i ].x = msg->points[ i ].x;
                 pl_full[ i ].y = msg->points[ i ].y;
@@ -209,7 +210,8 @@ void Preprocess::avia_handler( const livox_ros_driver::CustomMsg::ConstPtr &msg 
     {
         for ( uint i = 1; i < plsize; i++ )
         {
-            if ( ( msg->points[ i ].line < N_SCANS ) ) // && ((msg->points[i].tag & 0x30) == 0x10))
+            const bool pass_line = ( lidar_type == MID360 ) ? true : ( msg->points[ i ].line < N_SCANS );
+            if ( pass_line ) // && ((msg->points[i].tag & 0x30) == 0x10))
             {
                 valid_num++;
                 if ( valid_num % point_filter_num == 0 )
@@ -220,7 +222,8 @@ void Preprocess::avia_handler( const livox_ros_driver::CustomMsg::ConstPtr &msg 
                     pl_full[ i ].intensity = msg->points[ i ].reflectivity;
                     pl_full[ i ].curvature = msg->points[ i ].offset_time / float( 1000000 ); // use curvature as time of each laser points
 
-                    if ( ( pl_full[ i ].intensity > 4 ) &&
+                    const bool pass_reflectivity = ( lidar_type == MID360 ) ? true : ( pl_full[ i ].intensity > 4 );
+                    if ( pass_reflectivity &&
                          ( pl_full[ i ].x * pl_full[ i ].x + pl_full[ i ].y * pl_full[ i ].y + pl_full[ i ].z * pl_full[ i ].z > blind_sqr ) )
                     {
                         pl_surf.push_back( pl_full[ i ] );

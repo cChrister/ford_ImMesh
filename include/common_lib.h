@@ -65,7 +65,8 @@ enum LID_TYPE
     OUST64 = 3,
     L515 = 4,
     XT32 = 5,
-    VELO32 = 6
+    VELO32 = 6,
+    MID360 = 7
 }; //{1, 2, 3}
 
 enum TIME_UNIT

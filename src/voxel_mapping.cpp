@@ -1664,7 +1664,7 @@ int Voxel_mapping::service_LiDAR_update()
     // if (m_lidar_en)
     // {
     ros::Subscriber sub_pcl;
-    if ( m_p_pre->lidar_type == AVIA )
+    if ( m_p_pre->lidar_type == AVIA || m_p_pre->lidar_type == MID360 )
     {
         sub_pcl = m_ros_node_ptr->subscribe( m_lid_topic, 200000, &Voxel_mapping::livox_pcl_cbk, this );
     }
